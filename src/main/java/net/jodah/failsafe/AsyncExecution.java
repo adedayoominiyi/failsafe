@@ -18,7 +18,8 @@ package net.jodah.failsafe;
 import net.jodah.failsafe.internal.util.Assert;
 import net.jodah.failsafe.util.concurrent.Scheduler;
 
-import java.util.concurrent.Callable;
+import java.util.concurrent.*;
+import java.util.function.Supplier;
 
 /**
  * Tracks asynchronous executions and allows retries to be scheduled according to a {@link RetryPolicy}. May be
@@ -28,21 +29,19 @@ import java.util.concurrent.Callable;
  */
 @SuppressWarnings("WeakerAccess")
 public final class AsyncExecution extends AbstractExecution {
-  private final FailsafeFuture<Object> future;
-  private final Scheduler scheduler;
+  /** Used to complete a promise for a scheduled execution */
+  private static final Exception SCHEDULED = new Exception("The execution has been scheduled");
+
+  private Supplier<CompletableFuture<ExecutionResult>> executionSupplier;
+  final FailsafeFuture<Object> future;
+  final Scheduler scheduler;
   private volatile boolean completeCalled;
   private volatile boolean retryCalled;
 
-  @SuppressWarnings("unchecked")
   <T> AsyncExecution(Scheduler scheduler, FailsafeFuture<T> future, FailsafeExecutor<?> executor) {
     super((FailsafeExecutor<Object>) executor);
     this.scheduler = scheduler;
     this.future = (FailsafeFuture<Object>) future;
-  }
-
-  <T> AsyncExecution(Callable<T> callable, Scheduler scheduler, FailsafeFuture<T> future, FailsafeExecutor<?> config) {
-    this(scheduler, future, config);
-    inject(callable);
   }
 
   /**
@@ -51,7 +50,7 @@ public final class AsyncExecution extends AbstractExecution {
    * @throws IllegalStateException if the execution is already complete
    */
   public void complete() {
-    postExecute(ExecutionResult.noResult());
+    postExecute(ExecutionResult.NONE);
   }
 
   /**
@@ -107,7 +106,7 @@ public final class AsyncExecution extends AbstractExecution {
   public boolean retryFor(Object result, Throwable failure) {
     Assert.state(!retryCalled, "Retry has already been called");
     retryCalled = true;
-    return completeOrHandle(result, failure);
+    return !completeOrHandle(result, failure);
   }
 
   /**
@@ -139,10 +138,8 @@ public final class AsyncExecution extends AbstractExecution {
   boolean postExecute(ExecutionResult result) {
     synchronized (future) {
       if (!completeCalled) {
-        if (super.postExecute(result)) {
-          future.complete(result.result, result.failure);
-          executor.handleComplete(result, this);
-        }
+        if (super.postExecute(result))
+          complete(result, null);
         completeCalled = true;
       }
 
@@ -151,38 +148,88 @@ public final class AsyncExecution extends AbstractExecution {
   }
 
   /**
-   * Attempts to complete the execution else handle according to the configured policies.
+   * Attempts to complete the execution else handle according to the configured policies. Returns {@code true} if the
+   * execution was completed, else false which indicates the result was handled asynchronously and may have triggered a
+   * retry.
    *
    * @throws IllegalStateException if the execution is already complete
    */
   boolean completeOrHandle(Object result, Throwable failure) {
     synchronized (future) {
       ExecutionResult er = new ExecutionResult(result, failure);
-
-      if (!completeCalled) {
-        completeCalled = true;
+      if (!completeCalled)
         record(er);
-      }
+      completeCalled = true;
 
-      return executeAsync(er, scheduler, future) == null;
+      Supplier<CompletableFuture<ExecutionResult>> supplier = Functions.supplyOnce(
+          CompletableFuture.completedFuture(er), executionSupplier);
+      for (PolicyExecutor<Policy<Object>> policyExecutor : policyExecutors)
+        supplier = policyExecutor.supplyAsync(supplier, scheduler, future);
+
+      supplier.get().whenComplete(this::complete);
+      return completed;
     }
   }
 
-  /**
-   * Begins or continues an asynchronous execution from the last PolicyExecutor given the {@code result}.
-   *
-   * @return null if an execution has been scheduled
-   */
-  ExecutionResult executeAsync(ExecutionResult result, Scheduler scheduler, FailsafeFuture<Object> future) {
-    boolean shouldExecute = lastExecuted == null;
-    result = head.executeAsync(result, shouldExecute, scheduler, future);
+  void executeAsync(Supplier<CompletableFuture<ExecutionResult>> supplier, boolean makeAsync) {
+    for (PolicyExecutor<Policy<Object>> policyExecutor : policyExecutors)
+      supplier = policyExecutor.supplyAsync(supplier, scheduler, future);
+    if (makeAsync)
+      supplier = makeAsync(supplier);
+    supplier.get().whenComplete(this::complete);
+  }
 
+  <T> void executeAsyncExecution(Supplier<T> supplier) {
+    executionSupplier = makeAsyncExecution(supplier);
+    executionSupplier.get();
+  }
+
+  private void complete(ExecutionResult result, Throwable error) {
+    if (AsyncExecution.SCHEDULED.equals(error))
+      return;
+
+    completed = true;
     if (result != null) {
-      completed = true;
       executor.handleComplete(result, this);
       future.complete(result.result, result.failure);
-    }
+    } else
+      future.complete(null, error);
+  }
 
-    return result;
+  @SuppressWarnings("unchecked")
+  private Supplier<CompletableFuture<ExecutionResult>> makeAsync(
+      Supplier<CompletableFuture<ExecutionResult>> supplier) {
+    return () -> {
+      CompletableFuture<ExecutionResult> promise = new CompletableFuture<>();
+      Callable<Object> callable = () -> supplier.get().handle((result, error) -> {
+        // Propagate result
+        if (result != null)
+          promise.complete(result);
+        else
+          promise.completeExceptionally(error);
+        return result;
+      });
+
+      try {
+        future.inject((Future) scheduler.schedule(callable, 0, TimeUnit.NANOSECONDS));
+      } catch (Exception e) {
+        promise.completeExceptionally(e);
+      }
+      return promise;
+    };
+  }
+
+  @SuppressWarnings("unchecked")
+  private <T> Supplier<CompletableFuture<ExecutionResult>> makeAsyncExecution(Supplier<T> supplier) {
+    return () -> {
+      CompletableFuture<ExecutionResult> promise = new CompletableFuture<>();
+      try {
+        future.inject((Future) scheduler.schedule(supplier::get, 0, TimeUnit.NANOSECONDS));
+        promise.completeExceptionally(AsyncExecution.SCHEDULED);
+      } catch (Exception e) {
+        promise.completeExceptionally(e);
+      }
+      return promise;
+    };
   }
 }

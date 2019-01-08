@@ -15,14 +15,14 @@
  */
 package net.jodah.failsafe.function;
 
-import net.jodah.failsafe.ExecutionContext;
+import net.jodah.failsafe.AsyncExecution;
 
 /**
- * A callable that provides execution context.
+ * A supplier that manually triggers asynchronous retries or completion via an asynchronous execution.
  * 
  * @author Jonathan Halterman
  * @param <T> result type
  */
-public interface ContextualCallable<T> {
-  T call(ExecutionContext context) throws Exception;
+public interface AsyncSupplier<T> {
+  T get(AsyncExecution execution) throws Exception;
 }

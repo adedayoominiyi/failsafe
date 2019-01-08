@@ -28,7 +28,7 @@ public class FailsafeFutureTest {
 
   @Test(expectedExceptions = TimeoutException.class)
   public void shouldGetWithTimeout() throws Throwable {
-    Failsafe.with(new RetryPolicy()).with(executor).runAsync(() -> {
+    Failsafe.with(new RetryPolicy<>()).with(executor).runAsync(() -> {
       Thread.sleep(1000);
     }).get(100, TimeUnit.MILLISECONDS);
 

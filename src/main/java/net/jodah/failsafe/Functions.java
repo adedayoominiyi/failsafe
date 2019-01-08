@@ -18,10 +18,11 @@ package net.jodah.failsafe;
 import net.jodah.failsafe.function.*;
 import net.jodah.failsafe.internal.util.Assert;
 
-import java.util.concurrent.Callable;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.Semaphore;
+import java.util.function.Supplier;
 
 /**
  * Utilities for creating functions.
@@ -29,14 +30,95 @@ import java.util.concurrent.Semaphore;
  * @author Jonathan Halterman
  */
 final class Functions {
-  static <T> Callable<T> asyncOf(AsyncCallable<T> callable, AsyncExecution execution) {
-    Assert.notNull(callable, "callable");
-    return new Callable<T>() {
+  /** Returns a supplier that supplies the {@code result} once then uses the {@code supplier} for subsequent calls. */
+  static <T> Supplier<CompletableFuture<T>> supplyOnce(CompletableFuture<T> result,
+      Supplier<CompletableFuture<T>> supplier) {
+    return new Supplier<CompletableFuture<T>>() {
+      volatile boolean called;
+
       @Override
-      public synchronized T call() {
+      public CompletableFuture<T> get() {
+        if (!called) {
+          called = true;
+          return result;
+        } else
+          return supplier.get();
+      }
+    };
+  }
+
+  static <T> Supplier<CompletableFuture<ExecutionResult>> asyncOf(CheckedSupplier<T> supplier,
+      AsyncExecution execution) {
+    Assert.notNull(supplier, "supplier");
+    return () -> {
+      ExecutionResult result;
+      try {
+        execution.preExecute();
+        result = ExecutionResult.success(supplier.get());
+      } catch (Throwable e) {
+        result = ExecutionResult.failure(e);
+      }
+      execution.record(result);
+      return CompletableFuture.completedFuture(result);
+    };
+  }
+
+  static Supplier<CompletableFuture<ExecutionResult>> asyncOf(CheckedRunnable runnable, AsyncExecution execution) {
+    Assert.notNull(runnable, "runnable");
+    return () -> {
+      ExecutionResult result;
+      try {
+        execution.preExecute();
+        runnable.run();
+        result = ExecutionResult.NONE;
+      } catch (Throwable e) {
+        result = ExecutionResult.failure(e);
+      }
+      execution.record(result);
+      return CompletableFuture.completedFuture(result);
+    };
+  }
+
+  static <T> Supplier<CompletableFuture<ExecutionResult>> asyncOf(ContextualSupplier<T> supplier,
+      AsyncExecution execution) {
+    Assert.notNull(supplier, "supplier");
+    return () -> {
+      ExecutionResult result;
+      try {
+        execution.preExecute();
+        result = ExecutionResult.success(supplier.get(execution));
+      } catch (Throwable e) {
+        result = ExecutionResult.failure(e);
+      }
+      execution.record(result);
+      return CompletableFuture.completedFuture(result);
+    };
+  }
+
+  static Supplier<CompletableFuture<ExecutionResult>> asyncOf(ContextualRunnable runnable, AsyncExecution execution) {
+    Assert.notNull(runnable, "runnable");
+    return () -> {
+      ExecutionResult result;
+      try {
+        execution.preExecute();
+        runnable.run(execution);
+        result = ExecutionResult.NONE;
+      } catch (Throwable e) {
+        result = ExecutionResult.failure(e);
+      }
+      execution.record(result);
+      return CompletableFuture.completedFuture(result);
+    };
+  }
+
+  static <T> Supplier<T> asyncOfExecution(AsyncSupplier<T> supplier, AsyncExecution execution) {
+    Assert.notNull(supplier, "supplier");
+    return new Supplier<T>() {
+      @Override
+      public synchronized T get() {
         try {
           execution.preExecute();
-          return callable.call(execution);
+          return supplier.get(execution);
         } catch (Throwable e) {
           execution.completeOrHandle(null, e);
           return null;
@@ -45,45 +127,76 @@ final class Functions {
     };
   }
 
-  static <T> Callable<T> asyncOf(AsyncRunnable runnable, AsyncExecution execution) {
+  static <T> Supplier<T> asyncOfExecution(AsyncRunnable runnable, AsyncExecution execution) {
     Assert.notNull(runnable, "runnable");
-    return new Callable<T>() {
+    return new Supplier<T>() {
       @Override
-      public synchronized T call() {
+      public synchronized T get() {
         try {
           execution.preExecute();
           runnable.run(execution);
         } catch (Throwable e) {
           execution.completeOrHandle(null, e);
         }
-
         return null;
       }
     };
   }
 
-  static <T> Callable<T> asyncOf(Callable<T> callable, AsyncExecution execution) {
-    Assert.notNull(callable, "callable");
+  static <T> Supplier<CompletableFuture<ExecutionResult>> asyncOfFuture(
+      CheckedSupplier<? extends CompletionStage<? extends T>> supplier, AsyncExecution execution) {
+    Assert.notNull(supplier, "supplier");
     return () -> {
+      CompletableFuture<ExecutionResult> promise = new CompletableFuture<>();
       try {
         execution.preExecute();
-        T result = callable.call();
-        execution.completeOrHandle(result, null);
-        return result;
+        supplier.get().whenComplete((innerResult, failure) -> {
+          ExecutionResult result;
+          // Unwrap CompletionException cause
+          if (failure instanceof CompletionException)
+            result = ExecutionResult.failure(failure.getCause());
+          else
+            result = ExecutionResult.success(innerResult);
+          execution.record(result);
+          promise.complete(result);
+        });
       } catch (Throwable e) {
-        execution.completeOrHandle(null, e);
-        return null;
+        ExecutionResult result = ExecutionResult.failure(e);
+        execution.record(result);
+        promise.complete(result);
       }
+      return promise;
     };
+
+    //return () -> {
+    //      try {
+    //        execution.preExecute();
+    //        supplier.get().whenComplete((innerResult, failure) -> {
+    //          // Unwrap CompletionException cause
+    //          if (failure instanceof CompletionException)
+    //            failure = failure.getCause();
+    //          execution.completeOrHandle(innerResult, failure);
+    //        });
+    //      } catch (Throwable e) {
+    //        execution.completeOrHandle(null, e);
+    //      }
+    //
+    //      return null;
+    //    };
   }
 
-  static <T> Callable<T> asyncOf(CheckedRunnable runnable, AsyncExecution execution) {
-    Assert.notNull(runnable, "runnable");
+  static <T> Supplier<CompletableFuture<T>> asyncOfFuture(
+      ContextualSupplier<? extends CompletionStage<? extends T>> supplier, AsyncExecution execution) {
+    Assert.notNull(supplier, "supplier");
     return () -> {
       try {
         execution.preExecute();
-        runnable.run();
-        execution.completeOrHandle(null, null);
+        supplier.get(execution).whenComplete((innerResult, failure) -> {
+          // Unwrap CompletionException cause
+          if (failure instanceof CompletionException)
+            failure = failure.getCause();
+          execution.completeOrHandle(innerResult, failure);
+        });
       } catch (Throwable e) {
         execution.completeOrHandle(null, e);
       }
@@ -92,106 +205,60 @@ final class Functions {
     };
   }
 
-  static <T> Callable<T> asyncOf(ContextualCallable<T> callable, AsyncExecution execution) {
-    Assert.notNull(callable, "callable");
-    return () -> {
-      try {
-        execution.preExecute();
-        T result = callable.call(execution);
-        execution.completeOrHandle(result, null);
-        return result;
-      } catch (Throwable e) {
-        execution.completeOrHandle(null, e);
-        return null;
-      }
-    };
-  }
-
-  static <T> Callable<T> asyncOf(ContextualRunnable runnable, AsyncExecution execution) {
-    Assert.notNull(runnable, "runnable");
-    return () -> {
-      try {
-        execution.preExecute();
-        runnable.run(execution);
-        execution.completeOrHandle(null, null);
-      } catch (Throwable e) {
-        execution.completeOrHandle(null, e);
-      }
-
-      return null;
-    };
-  }
-
-  static <T> Callable<T> asyncOfFuture(AsyncCallable<? extends CompletionStage<? extends T>> callable, AsyncExecution execution) {
-    Assert.notNull(callable, "callable");
-    return new Callable<T>() {
+  static <T> Supplier<CompletableFuture<ExecutionResult>> asyncOfFutureExecution(
+      AsyncSupplier<? extends CompletionStage<? extends T>> supplier, AsyncExecution execution) {
+    Assert.notNull(supplier, "supplier");
+    return new Supplier<CompletableFuture<ExecutionResult>>() {
       Semaphore asyncFutureLock = new Semaphore(1);
 
       @Override
-      public T call() {
+      public CompletableFuture<ExecutionResult> get() {
+        CompletableFuture<ExecutionResult> promise = new CompletableFuture<>();
         try {
           execution.preExecute();
           asyncFutureLock.acquire();
-          callable.call(execution).whenComplete((innerResult, failure) -> {
+          supplier.get(execution).whenComplete((innerResult, failure) -> {
             try {
-              if (failure != null)
-                execution.completeOrHandle(innerResult, failure instanceof CompletionException ? failure.getCause() : failure);
+              // Unwrap CompletionException cause
+              ExecutionResult result = failure instanceof CompletionException ?
+                  ExecutionResult.failure(failure.getCause()) :
+                  ExecutionResult.success(innerResult);
+              execution.record(result);
+              promise.complete(result);
             } finally {
               asyncFutureLock.release();
             }
           });
         } catch (Throwable e) {
           try {
-            execution.completeOrHandle(null, e);
+            ExecutionResult result = ExecutionResult.failure(e);
+            execution.record(result);
+            promise.complete(result);
           } finally {
             asyncFutureLock.release();
           }
         }
 
-        return null;
+        return promise;
       }
     };
   }
 
-  static <T> Callable<T> asyncOfFuture(Callable<? extends CompletionStage<? extends T>> callable, AsyncExecution execution) {
-    Assert.notNull(callable, "callable");
+  static <T> Supplier<ExecutionResult> resultSupplierOf(CheckedSupplier<T> supplier, AbstractExecution execution) {
     return () -> {
+      ExecutionResult result = null;
       try {
-        execution.preExecute();
-        callable.call().whenComplete((innerResult, failure) -> {
-          // Unwrap CompletionException cause
-          if (failure instanceof CompletionException)
-            failure = failure.getCause();
-          execution.completeOrHandle(innerResult, failure);
-        });
-      } catch (Throwable e) {
-        execution.completeOrHandle(null, e);
+        result = ExecutionResult.success(supplier.get());
+      } catch (Throwable t) {
+        result = ExecutionResult.failure(t);
+      } finally {
+        execution.record(result);
       }
-
-      return null;
+      return result;
     };
   }
 
-  static <T> Callable<T> asyncOfFuture(ContextualCallable<? extends CompletionStage<? extends T>> callable, AsyncExecution execution) {
-    Assert.notNull(callable, "callable");
-    return () -> {
-      try {
-        execution.preExecute();
-        callable.call(execution).whenComplete((innerResult, failure) -> {
-          // Unwrap CompletionException cause
-          if (failure instanceof CompletionException)
-            failure = failure.getCause();
-          execution.completeOrHandle(innerResult, failure);
-        });
-      } catch (Throwable e) {
-        execution.completeOrHandle(null, e);
-      }
-
-      return null;
-    };
-  }
-
-  static <T> Callable<T> callableOf(CheckedRunnable runnable) {
+  static <T> CheckedSupplier<T> supplierOf(CheckedRunnable runnable) {
     Assert.notNull(runnable, "runnable");
     return () -> {
       runnable.run();
@@ -199,12 +266,12 @@ final class Functions {
     };
   }
 
-  static <T> Callable<T> callableOf(ContextualCallable<T> callable, ExecutionContext context) {
-    Assert.notNull(callable, "callable");
-    return () -> callable.call(context);
+  static <T> CheckedSupplier<T> supplierOf(ContextualSupplier<T> supplier, ExecutionContext context) {
+    Assert.notNull(supplier, "supplier");
+    return () -> supplier.get(context);
   }
 
-  static <T> Callable<T> callableOf(ContextualRunnable runnable, ExecutionContext context) {
+  static <T> CheckedSupplier<T> supplierOf(ContextualRunnable runnable, ExecutionContext context) {
     Assert.notNull(runnable, "runnable");
     return () -> {
       runnable.run(context);
@@ -212,8 +279,8 @@ final class Functions {
     };
   }
 
-  static <T, U, R> CheckedBiFunction<T, U, R> fnOf(Callable<R> callable) {
-    return (t, u) -> callable.call();
+  static <T, U, R> CheckedBiFunction<T, U, R> fnOf(CheckedSupplier<R> supplier) {
+    return (t, u) -> supplier.get();
   }
 
   static <T, U, R> CheckedBiFunction<T, U, R> fnOf(CheckedBiConsumer<T, U> consumer) {

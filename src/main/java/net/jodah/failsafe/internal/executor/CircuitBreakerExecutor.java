@@ -32,12 +32,12 @@ public class CircuitBreakerExecutor extends PolicyExecutor<CircuitBreaker> {
     super(circuitBreaker);
   }
 
-  @Override
-  protected ExecutionResult preExecute(ExecutionResult result) {
-    boolean allowsExecution = policy.allowsExecution();
-    if (allowsExecution)
+  protected ExecutionResult preExecute() {
+    if (policy.allowsExecution()) {
       policy.preExecute();
-    return allowsExecution ? result : ExecutionResult.failure(new CircuitBreakerOpenException());
+      return null;
+    }
+    return ExecutionResult.failure(new CircuitBreakerOpenException());
   }
 
   @Override
@@ -56,6 +56,6 @@ public class CircuitBreakerExecutor extends PolicyExecutor<CircuitBreaker> {
   @Override
   protected ExecutionResult onFailure(ExecutionResult result) {
     policy.recordFailure();
-    return result.with(true);
+    return result.withCompleted();
   }
 }

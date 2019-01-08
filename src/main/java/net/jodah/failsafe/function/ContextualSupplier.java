@@ -15,6 +15,14 @@
  */
 package net.jodah.failsafe.function;
 
-public interface CheckedConsumer<T> {
-  void accept(T t) throws Exception;
+import net.jodah.failsafe.ExecutionContext;
+
+/**
+ * A supplier that provides execution context.
+ * 
+ * @author Jonathan Halterman
+ * @param <T> result type
+ */
+public interface ContextualSupplier<T> {
+  T get(ExecutionContext context) throws Exception;
 }

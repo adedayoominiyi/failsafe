@@ -31,7 +31,7 @@ public class Issue52Test {
   @Test(expectedExceptions = CancellationException.class)
   public void shouldCancelExecutionViaFuture() throws Throwable {
     ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(2);
-    Future<String> proxyFuture = Failsafe.with(new RetryPolicy<>().withDelay(10, TimeUnit.MILLISECONDS))
+    Future<Object> proxyFuture = Failsafe.with(new RetryPolicy<>().withDelay(10, TimeUnit.MILLISECONDS))
         .with(scheduler)
         .getAsync(exec -> {
           throw new IllegalStateException();
